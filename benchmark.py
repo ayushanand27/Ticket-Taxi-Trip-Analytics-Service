@@ -7,7 +7,7 @@ WHY THIS MODULE EXISTS:
       2. Live FastAPI HTTP latency broken down into `DB p95`, `Handler p95`, and
          `Total HTTP p50/p95` using `X-DB-Time-Ms` and `X-Handler-Time-Ms` headers.
 
-    Defaults to `127.0.0.1` (avoiding Windows IPv6 `::1` fallback delays) and
+    Defaults to `127.0.0.1` (rules out an IPv6 `::1` fallback delay; no measurable effect) and
     `--iterations 200` so p95 reflects a true 95th percentile rather than max.
 
 USAGE (Windows PowerShell):

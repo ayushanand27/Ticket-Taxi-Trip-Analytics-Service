@@ -17,7 +17,7 @@ All four API endpoints are analytical `GROUP BY` aggregations across 43.5M rows.
 * **Columnar Storage (`MergeTree`):** ClickHouse reads only the 2–4 columns referenced by a query instead of scanning full row tuples.
 * **Incremental Pre-Aggregation (`MaterializedView` + `SummingMergeTree`):** As `ingest.py` inserts clean rows into `taxi_trips_clean`, ClickHouse automatically updates three summary tables (`hourly_zone_stats`, `distance_bucket_stats`, `daily_trip_counts`) in real time.
 * **Compact Types & Partitioning:** Partitioning by `toYYYYMM(pickup_datetime)` and ordering by `(pickup_datetime, pu_location_id, trip_hash)` with `LowCardinality`, `UInt16`, and `Float32` keeps storage compact and pruning fast.
-* **Persistent Thread-Local Client & `127.0.0.1` (`api.py`):** Defaults `CH_HOST` to `127.0.0.1` (avoiding Windows IPv6 `::1` fallback delays) and reuses one ClickHouse HTTP client per worker thread via `threading.local()`, saving ~25 ms per request.
+* **Persistent Thread-Local Client & `127.0.0.1` (`api.py`):** Reuses one ClickHouse HTTP client per worker thread via `threading.local()`, saving ~25 ms per request. `CH_HOST` defaults to `127.0.0.1` to rule out an IPv6 fallback delay; it made no measurable difference (p50 ~206 ms before and after).
 
 ### 2. Parallel, Vectorized, Idempotent Ingestion (`ingest.py`)
 Re-running `ingest.py` never creates duplicates in either raw or summary tables:
@@ -76,7 +76,7 @@ Measured over **200 iterations** per query (`python benchmark.py --iterations 20
 
 ```text
 .
-├── DESIGN.md              # One-page architecture & schema design doc
+├── design.md              # One-page architecture & schema design doc
 ├── docker-compose.yml     # ClickHouse 24.8 container + persistent volume
 ├── requirements.txt       # Python dependencies
 ├── 01_schema.sql          # ClickHouse tables & Materialized Views DDL
@@ -117,3 +117,16 @@ Measured over **200 iterations** per query (`python benchmark.py --iterations 20
    python -m uvicorn api:app --host 127.0.0.1 --port 8000
    python benchmark.py --iterations 200 --api-url http://127.0.0.1:8000
    ```
+
+---
+
+## Benchmark Method & Known Limitations
+
+**Method.** Each query runs 1 warm-up call, then N timed calls (default 200), against a local Docker ClickHouse. p95 is linearly interpolated. Run on a warm server (cache state affects the BEFORE/AFTER numbers a lot, so re-run before quoting them).
+
+**Open item: unexplained HTTP overhead.** ClickHouse answers the summary-table queries in ~16-20 ms, but the end-to-end HTTP p50 is ~200 ms. The API already returns `X-DB-Time-Ms` and `X-Handler-Time-Ms`, and `benchmark.py` reads them, but the DB / handler / total split is not yet published here. Until it is, about 180 ms per request is not attributed to any component.
+
+**Other limits.**
+* `rebuild_summary_tables()` truncates then refills the three summary tables, so the API can briefly see empty aggregates during a rebuild.
+* `test_pipeline.py` uses a fake ClickHouse client, so it checks the ingestion logic and not the real SQL. A test against the Docker container is still to do.
+* The parallel speedup (3.3x) compares different file sets (1 file vs 4 files); a same-files 1-worker vs 4-worker run is still to do.
