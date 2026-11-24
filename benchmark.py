@@ -1,23 +1,17 @@
 """
-benchmark.py — Before-and-After p95 Latency Benchmark (Raw Scan vs. Materialized Views + API).
+benchmark.py — Before-and-After p95 Latency Benchmark (200+ Iterations, DB vs. Handler vs. HTTP).
 
 WHY THIS MODULE EXISTS:
-    Ticket requirement #2 states:
-      "p95 latency under 300 ms on the full data. You'll need indexes or
-       pre-aggregated tables, and you must show before-and-after numbers."
+    Measures both:
+      1. ClickHouse BEFORE (raw `taxi_trips_clean` scan) vs. AFTER (Materialized Views).
+      2. Live FastAPI HTTP latency broken down into `DB p95`, `Handler p95`, and
+         `Total HTTP p50/p95` using `X-DB-Time-Ms` and `X-Handler-Time-Ms` headers.
 
-    This script runs each of the 4 analytical queries 20 times in two modes:
-      1. BEFORE (Raw `taxi_trips_clean` full scan)
-      2. AFTER  (Pre-aggregated Materialized View tables)
-    And optionally benchmarks the live FastAPI HTTP endpoints (`--api-url`)
-    to verify end-to-end HTTP p95 latency including JSON serialization.
+    Defaults to `127.0.0.1` (avoiding Windows IPv6 `::1` fallback delays) and
+    `--iterations 200` so p95 reflects a true 95th percentile rather than max.
 
 USAGE (Windows PowerShell):
-    # Terminal 1: Start the API
-    python -m uvicorn api:app --host 0.0.0.0 --port 8000
-
-    # Terminal 2: Run the benchmark (20 iterations per query)
-    python benchmark.py --iterations 20 --api-url http://localhost:8000
+    python benchmark.py --iterations 200 --api-url http://127.0.0.1:8000
 """
 
 from __future__ import annotations
@@ -34,12 +28,7 @@ import httpx
 
 
 def percentile(values: List[float], pct: float) -> float:
-    """Compute a linear-interpolated percentile (e.g., p50 or p95) in milliseconds.
-
-    WHY:
-        Writing an explicit percentile helper avoids pulling in NumPy just for
-        one summary statistic and makes the p95 calculation transparent.
-    """
+    """Compute linear-interpolated percentile in milliseconds."""
     ordered = sorted(values)
     if not ordered:
         return 0.0
@@ -51,21 +40,8 @@ def percentile(values: List[float], pct: float) -> float:
     return ordered[f] + (ordered[c] - ordered[f]) * (k - f)
 
 
-def time_fn(fn: Callable[[], object], iterations: int) -> Dict[str, float]:
-    """Execute `fn` `iterations` times (plus 1 warmup call) and return latency stats in ms.
-
-    WHY:
-        One warmup call ensures OS page cache and HTTP connection setup don't
-        artificially distort steady-state query latency, while still measuring
-        real full-data query execution across `iterations` runs.
-    """
-    fn()  # Warmup
-    samples_ms: List[float] = []
-    for _ in range(iterations):
-        t0 = time.perf_counter()
-        fn()
-        samples_ms.append((time.perf_counter() - t0) * 1000.0)
-
+def summarize(samples_ms: List[float]) -> Dict[str, float]:
+    """Return min, p50, p95, max in milliseconds."""
     return {
         "min": min(samples_ms),
         "p50": statistics.median(samples_ms),
@@ -74,16 +50,27 @@ def time_fn(fn: Callable[[], object], iterations: int) -> Dict[str, float]:
     }
 
 
+def time_fn(fn: Callable[[], object], iterations: int) -> Dict[str, float]:
+    """Execute `fn` `iterations` times (plus 1 warmup) and return latency stats."""
+    fn()  # Warmup
+    samples_ms: List[float] = []
+    for _ in range(iterations):
+        t0 = time.perf_counter()
+        fn()
+        samples_ms.append((time.perf_counter() - t0) * 1000.0)
+    return summarize(samples_ms)
+
+
 def main() -> None:
-    """Run before/after ClickHouse benchmarks and optional FastAPI HTTP benchmarks."""
+    """Run before/after ClickHouse benchmarks and instrumented FastAPI HTTP benchmarks."""
     parser = argparse.ArgumentParser(description="Benchmark raw vs. pre-aggregated queries.")
-    parser.add_argument("--iterations", type=int, default=20, help="Runs per query")
-    parser.add_argument("--api-url", default="http://localhost:8000", help="FastAPI base URL")
+    parser.add_argument("--iterations", type=int, default=200, help="Runs per query (default: 200)")
+    parser.add_argument("--api-url", default="http://127.0.0.1:8000", help="FastAPI base URL")
     parser.add_argument("--skip-api", action="store_true", help="Skip live HTTP endpoint benchmark")
     args = parser.parse_args()
 
     client = clickhouse_connect.get_client(
-        host=os.getenv("CH_HOST", "localhost"),
+        host=os.getenv("CH_HOST", "127.0.0.1"),
         port=int(os.getenv("CH_PORT", "8123")),
         username=os.getenv("CH_USER", "taxi_user"),
         password=os.getenv("CH_PASSWORD", "taxi_password"),
@@ -93,8 +80,6 @@ def main() -> None:
     total_rows = client.query("SELECT count() FROM taxi_analytics.taxi_trips_clean").result_rows[0][0]
     print(f"\nBenchmarking on {total_rows:,} clean rows ({args.iterations} iterations/query)\n")
 
-    # WHY: Each entry pairs the BEFORE (raw 40M-row scan) SQL with the AFTER
-    # (pre-aggregated SummingMergeTree) SQL for the exact same analytical question.
     queries: List[Tuple[str, str, str]] = [
         (
             "1. Top pickup zones (hour=18)",
@@ -172,18 +157,21 @@ def main() -> None:
         ),
     ]
 
+    # WHY: 20 raw full-table scans is plenty for BEFORE (since each takes ~150 ms),
+    # while AFTER uses the full `--iterations` (200) for a tight p95 estimate.
+    before_iters = min(args.iterations, 20)
     print(f"{'Query':<34} | {'BEFORE p95 (ms)':>15} | {'AFTER p95 (ms)':>14} | {'Speedup':>8}")
     print("-" * 80)
     for name, raw_sql, mv_sql in queries:
-        before = time_fn(lambda s=raw_sql: client.query(s).result_rows, args.iterations)
+        before = time_fn(lambda s=raw_sql: client.query(s).result_rows, before_iters)
         after = time_fn(lambda s=mv_sql: client.query(s).result_rows, args.iterations)
         speedup = before["p95"] / max(after["p95"], 0.01)
         print(f"{name:<34} | {before['p95']:>15.1f} | {after['p95']:>14.1f} | {speedup:>7.1f}x")
 
     if not args.skip_api:
-        print("\nLive FastAPI HTTP Endpoint p95 Latency:")
-        print(f"{'Endpoint':<48} | {'p50 (ms)':>10} | {'p95 (ms)':>10} | {'<300ms?':>7}")
-        print("-" * 84)
+        print("\nLive FastAPI HTTP Endpoint Latency (DB vs. Handler vs. Total HTTP):")
+        print(f"{'Endpoint':<44} | {'DB p95':>8} | {'Handler p95':>11} | {'HTTP p50':>8} | {'HTTP p95':>8} | {'<300ms?':>7}")
+        print("-" * 102)
         endpoints = [
             "/analytics/top-pickup-zones?hour=18&limit=10",
             "/analytics/fare-by-distance",
@@ -192,9 +180,26 @@ def main() -> None:
         ]
         with httpx.Client(base_url=args.api_url, timeout=10.0) as http:
             for ep in endpoints:
-                stats = time_fn(lambda u=ep: http.get(u).raise_for_status(), args.iterations)
-                ok = "PASS" if stats["p95"] < 300.0 else "FAIL"
-                print(f"{ep:<48} | {stats['p50']:>10.1f} | {stats['p95']:>10.1f} | {ok:>7}")
+                http.get(ep).raise_for_status()  # Warmup
+                http_ms: List[float] = []
+                db_ms: List[float] = []
+                handler_ms: List[float] = []
+                for _ in range(args.iterations):
+                    t0 = time.perf_counter()
+                    resp = http.get(ep)
+                    resp.raise_for_status()
+                    http_ms.append((time.perf_counter() - t0) * 1000.0)
+                    db_ms.append(float(resp.headers.get("X-DB-Time-Ms", "0")))
+                    handler_ms.append(float(resp.headers.get("X-Handler-Time-Ms", "0")))
+
+                h_stats = summarize(http_ms)
+                d_stats = summarize(db_ms)
+                hd_stats = summarize(handler_ms)
+                ok = "PASS" if h_stats["p95"] < 300.0 else "FAIL"
+                print(
+                    f"{ep:<44} | {d_stats['p95']:>8.1f} | {hd_stats['p95']:>11.1f} | "
+                    f"{h_stats['p50']:>8.1f} | {h_stats['p95']:>8.1f} | {ok:>7}"
+                )
 
 
 if __name__ == "__main__":
