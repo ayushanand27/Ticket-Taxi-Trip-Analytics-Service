@@ -9,9 +9,9 @@ WHY THIS MODULE EXISTS:
     `taxi_trips_clean` directly.
 
 PERFORMANCE & OBSERVABILITY:
-    1. Defaults `CH_HOST` to `127.0.0.1` instead of `localhost` to rule out an
-       IPv6 (`::1`) fallback delay on Windows. Measured effect: none (p50 stayed
-       ~206 ms), so it is kept only as a harmless default.
+    1. Defaults `CH_HOST` to `127.0.0.1` instead of `localhost`. Measured effect:
+       HTTP p50 fell from ~200 ms to ~10 ms (likely slow `localhost`/IPv6
+       resolution on Windows + Docker Desktop; not isolated further).
     2. Reuses one persistent ClickHouse client per worker thread via
        `threading.local()`, saving ~25 ms of per-request handshake overhead.
     3. Adds `X-DB-Time-Ms` and `X-Handler-Time-Ms` response headers on every

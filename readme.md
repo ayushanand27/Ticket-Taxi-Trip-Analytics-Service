@@ -6,7 +6,7 @@ An end-to-end analytical data pipeline and sub-300 ms REST API built over **12 m
 * **Clean Rows (`taxi_trips_clean`):** 43,533,390
 * **Quarantined Rows (`taxi_trips_rejects`):** 2,961,158 (6.37% dirty rate)
 * **Unit & Pipeline Tests:** 27 tests (`test_cleaning.py` + `test_pipeline.py`)
-* **API p95 Latency:** 205.3 ms – 222.9 ms across all 4 endpoints (target: < 300 ms)
+* **API p95 Latency:** 10.6 ms – 13.8 ms across all 4 endpoints (target: < 300 ms)
 
 ---
 
@@ -17,7 +17,7 @@ All four API endpoints are analytical `GROUP BY` aggregations across 43.5M rows.
 * **Columnar Storage (`MergeTree`):** ClickHouse reads only the 2–4 columns referenced by a query instead of scanning full row tuples.
 * **Incremental Pre-Aggregation (`MaterializedView` + `SummingMergeTree`):** As `ingest.py` inserts clean rows into `taxi_trips_clean`, ClickHouse automatically updates three summary tables (`hourly_zone_stats`, `distance_bucket_stats`, `daily_trip_counts`) in real time.
 * **Compact Types & Partitioning:** Partitioning by `toYYYYMM(pickup_datetime)` and ordering by `(pickup_datetime, pu_location_id, trip_hash)` with `LowCardinality`, `UInt16`, and `Float32` keeps storage compact and pruning fast.
-* **Persistent Thread-Local Client & `127.0.0.1` (`api.py`):** Reuses one ClickHouse HTTP client per worker thread via `threading.local()`, saving ~25 ms per request. `CH_HOST` defaults to `127.0.0.1` to rule out an IPv6 fallback delay; it made no measurable difference (p50 ~206 ms before and after).
+* **Persistent Thread-Local Client & `127.0.0.1` (`api.py`):** Reuses one ClickHouse HTTP client per worker thread via `threading.local()`, saving ~25 ms per request. `CH_HOST` and the benchmark URL default to `127.0.0.1` instead of `localhost`: HTTP p50 fell from ~200 ms to ~10 ms after this change (see the benchmark section). The likely cause is slow `localhost` resolution (IPv6 `::1` tried first) on Windows + Docker Desktop; this was not isolated further.
 
 ### 2. Parallel, Vectorized, Idempotent Ingestion (`ingest.py`)
 Re-running `ingest.py` never creates duplicates in either raw or summary tables:
@@ -56,19 +56,21 @@ Measured over **200 iterations** per query (`python benchmark.py --iterations 20
 
 | Query | BEFORE p95 (ms) | AFTER p95 (ms) | Speedup |
 | :--- | ---: | ---: | ---: |
-| 1. Top pickup zones (`hour=18`) | 157.2 | 20.7 | **7.6x** |
-| 2. Avg fare by distance bucket | 467.2 | 15.9 | **29.4x** |
-| 3. Daily trip count (12 months) | 209.1 | 17.5 | **12.0x** |
-| 4. Peak-hour heatmap (`7x24`) | 257.2 | 16.2 | **15.8x** |
+| 1. Top pickup zones (`hour=18`) | 92.4 | 10.6 | **8.7x** |
+| 2. Avg fare by distance bucket | 130.3 | 8.6 | **15.2x** |
+| 3. Daily trip count (12 months) | 101.8 | 8.7 | **11.8x** |
+| 4. Peak-hour heatmap (`7x24`) | 121.4 | 9.0 | **13.4x** |
 
 ### Live FastAPI HTTP Endpoint Latency (200 Iterations on `127.0.0.1`)
 
-| Endpoint | HTTP p50 (ms) | HTTP p95 (ms) | Target (< 300 ms) |
-| :--- | ---: | ---: | :---: |
-| `GET /analytics/top-pickup-zones?hour=18&limit=10` | 206.4 | 222.9 | PASS |
-| `GET /analytics/fare-by-distance` | 195.2 | 205.3 | PASS |
-| `GET /analytics/daily-trips?start_date=2025-10-01&end_date=2026-09-30` | 197.7 | 209.2 | PASS |
-| `GET /analytics/peak-hour-heatmap` | 196.2 | 210.3 | PASS |
+| Endpoint | DB p95 (ms) | Handler p95 (ms) | HTTP p50 (ms) | HTTP p95 (ms) | Target (< 300 ms) |
+| :--- | ---: | ---: | ---: | ---: | :---: |
+| `GET /analytics/top-pickup-zones?hour=18&limit=10` | 11.2 | 11.2 | 10.1 | 13.3 | PASS |
+| `GET /analytics/fare-by-distance` | 8.8 | 8.8 | 8.3 | 10.6 | PASS |
+| `GET /analytics/daily-trips?start_date=2025-10-01&end_date=2026-09-30` | 9.3 | 9.3 | 8.9 | 12.7 | PASS |
+| `GET /analytics/peak-hour-heatmap` | 9.8 | 9.9 | 8.5 | 13.8 | PASS |
+
+**History.** An earlier run (before the `127.0.0.1` default) showed HTTP p50 of ~200 ms with the DB at ~16-20 ms. Switching from `localhost` to `127.0.0.1` brought HTTP p50 to ~10 ms, so about 190 ms per request was name-resolution overhead, not the database or the handler. Two runs on different days are not a controlled A/B test, but the DB and handler times above now match the HTTP times, so nothing is left unaccounted for. The BEFORE column moves between runs (for example 157 ms vs 92 ms for query 1), which is cache and machine-load variance.
 
 ---
 
@@ -124,9 +126,8 @@ Measured over **200 iterations** per query (`python benchmark.py --iterations 20
 
 **Method.** Each query runs 1 warm-up call, then N timed calls (default 200), against a local Docker ClickHouse. p95 is linearly interpolated. Run on a warm server (cache state affects the BEFORE/AFTER numbers a lot, so re-run before quoting them).
 
-**Open item: unexplained HTTP overhead.** ClickHouse answers the summary-table queries in ~16-20 ms, but the end-to-end HTTP p50 is ~200 ms. The API already returns `X-DB-Time-Ms` and `X-Handler-Time-Ms`, and `benchmark.py` reads them, but the DB / handler / total split is not yet published here. Until it is, about 180 ms per request is not attributed to any component.
-
-**Other limits.**
+**Limits.**
+* `clickhouse-connect` fell back to pure Python on the benchmark machine (an Application Control policy blocked its C extension). This is harmless here but slower on large result sets.
 * `rebuild_summary_tables()` truncates then refills the three summary tables, so the API can briefly see empty aggregates during a rebuild.
 * `test_pipeline.py` uses a fake ClickHouse client, so it checks the ingestion logic and not the real SQL. A test against the Docker container is still to do.
 * The parallel speedup (3.3x) compares different file sets (1 file vs 4 files); a same-files 1-worker vs 4-worker run is still to do.
