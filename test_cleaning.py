@@ -186,3 +186,34 @@ def test_serialize_raw_payload_handles_datetime_and_nan() -> None:
 
     assert decoded["tpep_pickup_datetime"] == "2026-03-15T14:10:00"
     assert decoded["trip_distance"] is None
+
+def test_timestamps_are_tagged_utc_so_client_timezone_cannot_shift_them() -> None:
+    """Regression: naive datetimes were converted to an epoch with the CLIENT's local
+    timezone, so an IST laptop stored every pickup 5h30m early. Output must be UTC-tagged
+    and its epoch must equal the wall clock written in the file, on any machine."""
+    import calendar
+    from datetime import timezone
+
+    import pyarrow as pa
+
+    from cleaning import validate_arrow_batch
+
+    pickup = datetime(2025, 9, 30, 22, 54, 51)
+    dropoff = datetime(2025, 9, 30, 23, 10, 0)
+    expected_epoch = calendar.timegm(pickup.timetuple())
+
+    # single-row path
+    row = make_valid_row(tpep_pickup_datetime=pickup, tpep_dropoff_datetime=dropoff)
+    cleaned = validate_trip_row(row, source_file="f.parquet", row_index=0).cleaned_row
+    assert cleaned["pickup_datetime"].tzinfo == timezone.utc
+    assert cleaned["dropoff_datetime"].tzinfo == timezone.utc
+    assert cleaned["pickup_datetime"].replace(tzinfo=None) == pickup  # wall clock unchanged
+    assert cleaned["pickup_datetime"].timestamp() == expected_epoch
+
+    # batch (Arrow) path
+    cols = {k: [v] for k, v in row.items()}
+    batch = pa.RecordBatch.from_pydict(cols)
+    clean, _rejects = validate_arrow_batch(batch, "f.parquet", 0)
+    assert clean["pickup_datetime"][0].tzinfo == timezone.utc
+    assert clean["pickup_datetime"][0].timestamp() == expected_epoch
+    assert clean["dropoff_datetime"][0].tzinfo == timezone.utc

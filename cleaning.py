@@ -20,7 +20,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
@@ -56,7 +56,7 @@ def _is_missing(value: Any) -> bool:
 
 
 def _to_naive_datetime(value: Any) -> Optional[datetime]:
-    """Normalize a timestamp value to a timezone-naive Python `datetime`."""
+    """Normalize a timestamp value to a timezone-naive Python `datetime` (wall clock as written)."""
     if _is_missing(value):
         return None
     if isinstance(value, datetime):
@@ -64,6 +64,18 @@ def _to_naive_datetime(value: Any) -> Optional[datetime]:
     if isinstance(value, str):
         return datetime.fromisoformat(value).replace(tzinfo=None)
     return None
+
+
+def _wallclock_as_utc(value: datetime) -> datetime:
+    """Tag a wall-clock datetime as UTC before it goes to ClickHouse.
+
+    WHY:
+        clickhouse-connect turns a *naive* datetime into an epoch using the CLIENT machine's
+        local timezone. On an IST laptop that stored every timestamp 5h30m earlier than the
+        Parquet value (found by comparing live vs batch windows in Ticket 2). Marking the value
+        UTC makes the stored epoch match the wall clock in the file, on any machine.
+    """
+    return value.replace(tzinfo=timezone.utc)
 
 
 def compute_trip_hash(source_file: str, row_index: int) -> int:
@@ -152,8 +164,8 @@ def validate_trip_row(
         "trip_hash": compute_trip_hash(source_file, row_index),
         "source_file": source_file,
         "vendor_id": vendor_id,
-        "pickup_datetime": pickup_dt,
-        "dropoff_datetime": dropoff_dt,
+        "pickup_datetime": _wallclock_as_utc(pickup_dt),
+        "dropoff_datetime": _wallclock_as_utc(dropoff_dt),
         "passenger_count": passenger_count,
         "trip_distance": trip_distance,
         "pu_location_id": int(raw_row["PULocationID"]),
@@ -280,10 +292,10 @@ def validate_arrow_batch(
             "source_file": [source_file] * n_clean,
             "vendor_id": [max(0, int(v)) for v in _col_or_default("VendorID", 0)],
             "pickup_datetime": [
-                v.replace(tzinfo=None) for v in clean_batch.column("tpep_pickup_datetime").to_pylist()
+                _wallclock_as_utc(v) for v in clean_batch.column("tpep_pickup_datetime").to_pylist()
             ],
             "dropoff_datetime": [
-                v.replace(tzinfo=None) for v in clean_batch.column("tpep_dropoff_datetime").to_pylist()
+                _wallclock_as_utc(v) for v in clean_batch.column("tpep_dropoff_datetime").to_pylist()
             ],
             "passenger_count": [
                 None if v is None else max(0, int(v))
