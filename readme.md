@@ -85,7 +85,9 @@ Measured over **200 iterations** per query (`python benchmark.py --iterations 20
 ├── db_init.py             # Schema initializer & taxi_zones CSV seeder
 ├── cleaning.py            # Row-level & vectorized PyArrow validation logic
 ├── test_cleaning.py       # 23 pytest unit tests for cleaning logic
-├── test_pipeline.py       # API, aggregate-idempotency, & parallel-ingestion tests
+├── test_pipeline.py       # API, aggregate-idempotency, & parallel-ingestion tests (fake ClickHouse)
+├── test_integration.py    # Opt-in tests against a real ClickHouse, in a throw-away database
+├── bench_ingest.py        # Same-files 1-worker vs N-worker ingestion timing
 ├── ingest.py              # Parallel, vectorized, idempotent Parquet loader
 ├── api.py                 # FastAPI service (4 endpoints + /health + timing headers)
 ├── benchmark.py           # 200-iter before/after ClickHouse & FastAPI p95 benchmark
@@ -129,5 +131,5 @@ Measured over **200 iterations** per query (`python benchmark.py --iterations 20
 **Limits.**
 * `clickhouse-connect` fell back to pure Python on the benchmark machine (an Application Control policy blocked its C extension). This is harmless here but slower on large result sets.
 * `rebuild_summary_tables()` truncates then refills the three summary tables, so the API can briefly see empty aggregates during a rebuild.
-* `test_pipeline.py` uses a fake ClickHouse client, so it checks the ingestion logic and not the real SQL. A test against the Docker container is still to do.
-* The parallel speedup (3.3x) compares different file sets (1 file vs 4 files); a same-files 1-worker vs 4-worker run is still to do.
+* `test_pipeline.py` uses a fake ClickHouse client, so it checks the ingestion logic and not the real SQL. `test_integration.py` covers the real SQL in a separate `taxi_analytics_itest` database (it never touches the real tables). It is opt-in: `$env:RUN_CH_INTEGRATION="1"; python -m pytest test_integration.py -v`. Its first run on the author's machine is still pending, so no pass is claimed yet.
+* The earlier "3.3x" parallel speed-up compared different file sets (1 file vs 4 files) and should not be quoted. `bench_ingest.py` times the same files at 1 and 4 workers (`python bench_ingest.py --data-dir nyc_yellow_taxi --files 4 --yes`); results pending.
