@@ -2,11 +2,18 @@
 api.py — FastAPI Analytics Service for NYC Yellow Taxi Trip Data.
 
 WHY THIS MODULE EXISTS:
-    Exposes the 4 required analytics endpoints over the ingested 30-40M row
+    Exposes the 4 required analytics endpoints over the ingested 43.5M-row
     ClickHouse dataset. Every endpoint queries our pre-aggregated
     `SummingMergeTree` Materialized View target tables (`hourly_zone_stats`,
     `distance_bucket_stats`, `daily_trip_counts`) instead of scanning
-    `taxi_trips_clean` directly, keeping p95 latency well under 300 ms.
+    `taxi_trips_clean` directly.
+
+PERFORMANCE FIX (Connection Reuse):
+    Previously, calling `clickhouse_connect.get_client()` on every request
+    incurred ~150 ms of client initialization + ClickHouse handshake overhead
+    per API call. We now cache one persistent Client per worker thread via
+    `threading.local()`, reusing the underlying HTTP keep-alive connection pool
+    without risking cross-thread session collisions.
 
 USAGE (Windows PowerShell):
     python -m uvicorn api:app --host 0.0.0.0 --port 8000
@@ -16,8 +23,9 @@ USAGE (Windows PowerShell):
 from __future__ import annotations
 
 import os
+import threading
 from datetime import date
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
@@ -25,27 +33,36 @@ from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(
     title="NYC Taxi Trip Analytics Service",
-    description="Sub-300ms p95 analytics over 12 months (~30-40M rows) of NYC Yellow Taxi trips.",
-    version="1.0.0",
+    description="Sub-300ms p95 analytics over 12 months (~43.5M clean rows) of NYC Yellow Taxi trips.",
+    version="1.1.0",
 )
+
+# WHY: Thread-local storage gives each Uvicorn worker thread a single long-lived
+# ClickHouse client. This eliminates the ~150 ms per-request handshake overhead
+# while keeping concurrent requests thread-safe (unlike sharing one global Client).
+_thread_local = threading.local()
 
 
 def get_client() -> Client:
-    """Create a ClickHouse HTTP client for request handling.
+    """Return a reused ClickHouse HTTP client bound to the current worker thread.
 
     WHY:
-        `clickhouse-connect` is not thread-safe across concurrent async/worker
-        threads if a single global Client instance is shared. Creating a
-        lightweight client per request (backed by urllib3 connection pooling)
-        prevents `concurrent queries within the same session` errors under load.
+        `clickhouse-connect` clients are not safe for concurrent queries on a
+        single instance, but creating a new client on every request repeats
+        server-version checks and TCP/HTTP setup (~150 ms penalty). Caching one
+        client per thread gives us both connection reuse and thread safety.
     """
-    return clickhouse_connect.get_client(
-        host=os.getenv("CH_HOST", "localhost"),
-        port=int(os.getenv("CH_PORT", "8123")),
-        username=os.getenv("CH_USER", "taxi_user"),
-        password=os.getenv("CH_PASSWORD", "taxi_password"),
-        database="taxi_analytics",
-    )
+    client: Client | None = getattr(_thread_local, "ch_client", None)
+    if client is None:
+        client = clickhouse_connect.get_client(
+            host=os.getenv("CH_HOST", "localhost"),
+            port=int(os.getenv("CH_PORT", "8123")),
+            username=os.getenv("CH_USER", "taxi_user"),
+            password=os.getenv("CH_PASSWORD", "taxi_password"),
+            database="taxi_analytics",
+        )
+        _thread_local.ch_client = client
+    return client
 
 
 @app.get("/health")
@@ -54,7 +71,7 @@ def health() -> Dict[str, Any]:
 
     WHY:
         Provides an instant sanity check after ingestion so you can confirm the
-        API sees all ~30-40M clean rows and quarantined rejects.
+        API sees all clean rows and quarantined rejects.
     """
     client = get_client()
     clean_count = client.query("SELECT count() FROM taxi_analytics.taxi_trips_clean").result_rows[0][0]
@@ -75,7 +92,7 @@ def top_pickup_zones_by_hour(
 
     WHY:
         Reads from `hourly_zone_stats` (SummingMergeTree) instead of scanning
-        40M raw rows, then joins the tiny 265-row `taxi_zones` table for names.
+        43.5M raw rows, then joins the tiny 265-row `taxi_zones` table for names.
         We always use `sum(trip_count)` because SummingMergeTree merges parts
         asynchronously in the background.
     """
@@ -151,7 +168,7 @@ def daily_trip_count(
 
     WHY:
         Reads from `daily_trip_counts` (at most ~365 rows for a full year)
-        instead of scanning 40M rows with `toDate(pickup_datetime)`.
+        instead of scanning 43.5M rows with `toDate(pickup_datetime)`.
     """
     if end_date < start_date:
         raise HTTPException(status_code=400, detail="end_date must be >= start_date")

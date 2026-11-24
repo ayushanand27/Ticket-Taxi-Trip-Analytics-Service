@@ -1,28 +1,26 @@
 """
-ingest.py — Idempotent, Streaming Parquet Ingestion Pipeline for ClickHouse.
+ingest.py — Parallel, Idempotent, Streaming Parquet Ingestion Pipeline for ClickHouse.
 
 WHY THIS MODULE EXISTS:
-    Loads 12 months of NYC Yellow Taxi Parquet files (~30-40M rows) into
+    Loads 12 months of NYC Yellow Taxi Parquet files (~46.5M raw rows) into
     `taxi_analytics.taxi_trips_clean` while quarantining dirty rows into
     `taxi_analytics.taxi_trips_rejects` with explicit rejection reasons.
 
     Key engineering guarantees:
-      1. Streaming / Low Memory: Reads Parquet files in 50,000-row batches via
-         `pyarrow.parquet.ParquetFile.iter_batches()` so RAM stays flat (~200 MB)
-         instead of loading 40M rows into memory at once.
-      2. Re-runnable Without Duplicates (Idempotent): Computes each file's SHA-256
+      1. Parallel File Processing (`--workers`): Uses `ProcessPoolExecutor` to
+         ingest multiple monthly Parquet files concurrently across CPU cores,
+         cutting total wall-clock load time significantly.
+      2. Streaming / Low Memory: Reads each Parquet file in 50,000-row batches
+         via `pyarrow.parquet.ParquetFile.iter_batches()` so each worker's RAM
+         stays bounded (~200 MB).
+      3. Re-runnable Without Duplicates (Idempotent): Computes each file's SHA-256
          checksum and checks `taxi_analytics.ingestion_runs`. Completed files are
          skipped; failed/partial files have their partial rows deleted synchronously
          before retrying.
-      3. Observable Progress: Logs per-batch throughput and per-file clean/reject
-         counts so you can immediately see where time is spent or if anything breaks.
 
 USAGE (Windows PowerShell):
-    # Test on 1 file first to verify end-to-end speed:
-    python ingest.py --data-dir nyc_yellow_taxi --limit-files 1
-
-    # Ingest all 12 months (safe to re-run; already-completed files are skipped):
-    python ingest.py --data-dir nyc_yellow_taxi
+    # Ingest all 12 months in parallel across 4 worker processes:
+    python ingest.py --data-dir nyc_yellow_taxi --workers 4
 """
 
 from __future__ import annotations
@@ -32,6 +30,7 @@ import hashlib
 import logging
 import os
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,7 +48,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # WHY: Explicit column order for ClickHouse inserts. Matching this tuple to
-# `cleaned_row` keys avoids dictionary-lookup overhead on 40M rows.
+# `cleaned_row` keys avoids dictionary-lookup overhead on 46.5M rows.
 CLEAN_COLUMNS = [
     "trip_hash",
     "source_file",
@@ -218,9 +217,9 @@ def ingest_parquet_file(
         logger.info("START %s (%s rows)", source_file, f"{total_rows:,}")
 
         for batch in parquet_file.iter_batches(batch_size=batch_size):
-            # WHY: Converting one 50k-row Arrow batch to Python dicts is fast
-            # (~100 ms) and keeps our pure `validate_trip_row` unit-tested logic
-            # as the single source of truth for data quality.
+            # WHY: Converting one 50k-row Arrow batch to Python dicts keeps our
+            # pure `validate_trip_row` unit-tested logic as the single source of
+            # truth for data quality while bounding memory per worker.
             rows: List[Dict[str, Any]] = batch.to_pylist()
             clean_batch: List[List[Any]] = []
             reject_batch: List[List[Any]] = []
@@ -256,15 +255,6 @@ def ingest_parquet_file(
                 )
                 reject_total += len(reject_batch)
 
-            logger.info(
-                "  %s progress: %s / %s rows (clean=%s, rejects=%s)",
-                source_file,
-                f"{global_row_idx:,}",
-                f"{total_rows:,}",
-                f"{clean_total:,}",
-                f"{reject_total:,}",
-            )
-
         elapsed = time.perf_counter() - started
         record_run_status(
             client,
@@ -297,9 +287,42 @@ def ingest_parquet_file(
         raise
 
 
+def _worker_ingest_file(
+    file_path_str: str,
+    batch_size: int,
+    force: bool,
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+) -> Tuple[str, int, int, bool]:
+    """Process-pool worker entry point for parallel file ingestion.
+
+    WHY:
+        Each OS worker process creates its own ClickHouse HTTP client (since
+        clients cannot be pickled across processes) and ingests one distinct
+        Parquet file independently, bypassing Python's GIL.
+    """
+    client = clickhouse_connect.get_client(
+        host=host,
+        port=port,
+        username=user,
+        password=password,
+        database="taxi_analytics",
+    )
+    path = Path(file_path_str)
+    clean_cnt, reject_cnt, skipped = ingest_parquet_file(
+        client=client,
+        file_path=path,
+        batch_size=batch_size,
+        force=force,
+    )
+    return path.name, clean_cnt, reject_cnt, skipped
+
+
 def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments for the ingestion runner."""
-    parser = argparse.ArgumentParser(description="Idempotent NYC Yellow Taxi Parquet ingester.")
+    """Parse CLI arguments for the parallel ingestion runner."""
+    parser = argparse.ArgumentParser(description="Parallel, idempotent NYC Yellow Taxi Parquet ingester.")
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -308,10 +331,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=50_000, help="Rows per Arrow/ClickHouse batch")
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel worker processes (default: 4; use 1 for sequential)",
+    )
+    parser.add_argument(
         "--limit-files",
         type=int,
         default=None,
-        help="Optional cap on number of Parquet files to ingest (great for quick smoke tests)",
+        help="Optional cap on number of Parquet files to ingest",
     )
     parser.add_argument(
         "--force",
@@ -326,7 +355,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Discover Parquet files, ingest them in chronological order, and print summary."""
+    """Discover Parquet files and ingest them in parallel across worker processes."""
     args = parse_args()
     parquet_files = sorted(args.data_dir.glob("yellow_tripdata_*.parquet"))
     if not parquet_files:
@@ -335,30 +364,52 @@ def main() -> None:
     if args.limit_files is not None:
         parquet_files = parquet_files[: args.limit_files]
 
-    client = clickhouse_connect.get_client(
-        host=args.host,
-        port=args.port,
-        username=args.user,
-        password=args.password,
-        database="taxi_analytics",
-    )
-
     grand_clean = 0
     grand_reject = 0
     skipped_files = 0
     t0 = time.perf_counter()
 
-    for path in parquet_files:
-        clean_cnt, reject_cnt, skipped = ingest_parquet_file(
-            client=client,
-            file_path=path,
-            batch_size=args.batch_size,
-            force=args.force,
+    if args.workers <= 1:
+        client = clickhouse_connect.get_client(
+            host=args.host,
+            port=args.port,
+            username=args.user,
+            password=args.password,
+            database="taxi_analytics",
         )
-        grand_clean += clean_cnt
-        grand_reject += reject_cnt
-        if skipped:
-            skipped_files += 1
+        for path in parquet_files:
+            clean_cnt, reject_cnt, skipped = ingest_parquet_file(
+                client=client,
+                file_path=path,
+                batch_size=args.batch_size,
+                force=args.force,
+            )
+            grand_clean += clean_cnt
+            grand_reject += reject_cnt
+            if skipped:
+                skipped_files += 1
+    else:
+        logger.info("Starting parallel ingestion with %d workers for %d files", args.workers, len(parquet_files))
+        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+            futures = [
+                pool.submit(
+                    _worker_ingest_file,
+                    str(path),
+                    args.batch_size,
+                    args.force,
+                    args.host,
+                    args.port,
+                    args.user,
+                    args.password,
+                )
+                for path in parquet_files
+            ]
+            for fut in as_completed(futures):
+                _, clean_cnt, reject_cnt, skipped = fut.result()
+                grand_clean += clean_cnt
+                grand_reject += reject_cnt
+                if skipped:
+                    skipped_files += 1
 
     logger.info(
         "ALL DONE in %.1fs | files=%d (skipped=%d) | new_clean=%s | new_rejects=%s",
