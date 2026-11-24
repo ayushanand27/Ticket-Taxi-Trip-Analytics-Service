@@ -1,0 +1,15 @@
+# WHY: Never commit multi-gigabyte raw NYC TLC Parquet files to GitHub
+# (GitHub blocks files > 100 MB, and data should be downloaded via script).
+nyc_yellow_taxi/
+*.parquet
+*.csv
+
+# Python virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local environment overrides
+.env

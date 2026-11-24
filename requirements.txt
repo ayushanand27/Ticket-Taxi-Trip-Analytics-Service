@@ -1,0 +1,31 @@
+# Core dependencies for Step 2–5 (Database, Ingestion, API, Benchmarking, Tests)
+
+# WHY: Pinning minimum compatible versions keeps local Windows Python environments reproducible.
+
+
+
+# Official ClickHouse HTTP/Arrow Python client (fast bulk inserts via Arrow/NumPy)
+
+clickhouse-connect>=0.7.16
+
+
+
+# Columnar Parquet reader — reads 30-40M rows in streaming row-group batches without OOM
+
+pyarrow>=16.0.0
+
+
+
+# REST API framework + ASGI server for the 4 analytics endpoints
+
+fastapi>=0.111.0
+
+uvicorn[standard]>=0.30.0
+
+
+
+# Unit testing for cleaning logic + HTTP client for API tests & p95 latency benchmarks
+
+pytest>=8.2.0
+
+httpx>=0.27.0

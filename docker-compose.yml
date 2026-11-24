@@ -1,0 +1,44 @@
+# docker-compose.yml
+# WHY: We run ClickHouse inside Docker so that Windows users get the exact same
+# Linux-native analytical database environment without manual Windows binaries or WSL tuning.
+
+services:
+  clickhouse:
+    # WHY: Pinning a major/minor tag (24.8) prevents unexpected breaking SQL/driver changes
+    # across machines, unlike using `:latest`.
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: taxi_clickhouse
+    ports:
+      # WHY: 8123 is ClickHouse's HTTP interface, which Python's `clickhouse-connect`
+      # and curl/browser health checks use.
+      - "8123:8123"
+      # WHY: 9000 is ClickHouse's native TCP protocol port, useful if you connect
+      # via `clickhouse-client` or high-throughput native tools.
+      - "9000:9000"
+    environment:
+      # WHY: Pre-creating the database and setting a local dev user/password ensures
+      # our ingestion and API scripts can connect deterministically on first boot.
+      CLICKHOUSE_DB: taxi_analytics
+      CLICKHOUSE_USER: taxi_user
+      CLICKHOUSE_PASSWORD: taxi_password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      # WHY: Named Docker volume persists ingested 30-40M rows across container restarts
+      # so you don't have to re-ingest 12 Parquet files every time you reboot Windows.
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      # WHY: ClickHouse opens many file descriptors for MergeTree parts/partitions;
+      # raising nofile prevents "Too many open files" errors during 12-month ingestion.
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      # WHY: Allows `docker compose up -d --wait` and scripts to verify ClickHouse
+      # is actually ready to accept SQL queries, not just that the container started.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  clickhouse_data:
