@@ -35,7 +35,7 @@ import os
 import re
 import sys
 import types
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterator
@@ -252,7 +252,7 @@ def test_retry_after_failed_run_does_not_double_count(env: SimpleNamespace, samp
     """
     _run(env, sample_file)
     sha = env.ingest.compute_file_sha256(sample_file)
-    future = datetime.utcnow() + timedelta(minutes=1)  # WHY: must sort after the 'completed' row
+    future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=1)  # WHY: must sort after the 'completed' row
     env.client.insert(
         table=f"{TEST_DB}.ingestion_runs",
         data=[[sample_file.name, sha, "failed", 0, 0, "simulated crash", future, future]],

@@ -5,7 +5,7 @@ An end-to-end analytical data pipeline and sub-300 ms REST API built over **12 m
 * **Total Processed:** 46,494,548 rows
 * **Clean Rows (`taxi_trips_clean`):** 43,533,390
 * **Quarantined Rows (`taxi_trips_rejects`):** 2,961,158 (6.37% dirty rate)
-* **Unit & Pipeline Tests:** 27 tests (`test_cleaning.py` + `test_pipeline.py`)
+* **Tests:** 27 unit/pipeline tests (`test_cleaning.py` + `test_pipeline.py`) + 5 integration tests against a real ClickHouse (`test_integration.py`), all passing
 * **API p95 Latency:** 10.6 ms – 13.8 ms across all 4 endpoints (target: < 300 ms)
 
 ---
@@ -25,12 +25,14 @@ Re-running `ingest.py` never creates duplicates in either raw or summary tables:
 2. **Parallel Workers (`--workers 4`):** Uses `ProcessPoolExecutor` to ingest multiple monthly Parquet files concurrently across CPU cores.
 3. **Full Idempotency (Raw + Summary Rebuild):** Checks `(source_file, file_sha256)` in `ingestion_runs`. Completed files are skipped (`SKIP` in 2.0s for all 12 files). If any file is retried after failure or with `--force`, partial raw rows are synchronously deleted (`SETTINGS mutations_sync = 1`) and `rebuild_summary_tables()` truncates and rebuilds all 3 `SummingMergeTree` tables from `taxi_trips_clean` (~1.6s for 43.5M rows) so summary metrics never double-count.
 
-**Measured Ingestion Throughput (Vectorized PyArrow):**
+**Measured Ingestion Throughput (same 4 files for every run, `bench_ingest.py`):**
 
-| Mode | Files / Rows | Wall-Clock Time | Effective Throughput |
-| :--- | :--- | ---: | ---: |
-| Sequential (`--workers 1`) | 1 file (`2025-10`, 4,428,699 rows) | 94.9s (101.6s w/ rebuild) | ~46,667 rows/sec |
-| Parallel (`--workers 4`) | 4 files (`2025-10`–`2026-01`, 16,640,038 rows) | 109.2s total | **~152,381 rows/sec (3.3x)** |
+| Workers | Files | Rows | Wall-clock (s) | Rows/sec | Speed-up |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4 (`2025-10`–`2026-01`) | 16,640,038 | 141.0 | 118,001 | 1.00x |
+| 4 | 4 (`2025-10`–`2026-01`) | 16,640,038 | 93.9 | 177,227 | **1.50x** |
+
+Parallelism helps, but far less than 4x. Per-file load time went from ~28-34 s (1 worker) to ~59-81 s (4 workers at once), so the workers are competing for something shared rather than scaling independently. Candidate causes, **not yet isolated**: the single ClickHouse container and its merges, Docker Desktop on Windows, and `clickhouse-connect` running its pure-Python fallback because an Application Control policy blocked its C extension on this machine. About 11 s of each run is the same fixed cost (deleting old rows, rebuilding the summary tables), which slightly understates the parallel gain.
 
 ### 3. Bad Data Quarantine & Reject Breakdown (`cleaning.py`)
 Every row passes through `validate_trip_row()` / `validate_arrow_batch()` before insertion. Invalid rows are quarantined in `taxi_trips_rejects` with a standardized `reject_reason` and serialized JSON `raw_payload`:
@@ -131,5 +133,5 @@ Measured over **200 iterations** per query (`python benchmark.py --iterations 20
 **Limits.**
 * `clickhouse-connect` fell back to pure Python on the benchmark machine (an Application Control policy blocked its C extension). This is harmless here but slower on large result sets.
 * `rebuild_summary_tables()` truncates then refills the three summary tables, so the API can briefly see empty aggregates during a rebuild.
-* `test_pipeline.py` uses a fake ClickHouse client, so it checks the ingestion logic and not the real SQL. `test_integration.py` covers the real SQL in a separate `taxi_analytics_itest` database (it never touches the real tables). It is opt-in: `$env:RUN_CH_INTEGRATION="1"; python -m pytest test_integration.py -v`. Its first run on the author's machine is still pending, so no pass is claimed yet.
-* The earlier "3.3x" parallel speed-up compared different file sets (1 file vs 4 files) and should not be quoted. `bench_ingest.py` times the same files at 1 and 4 workers (`python bench_ingest.py --data-dir nyc_yellow_taxi --files 4 --yes`); results pending.
+* `test_pipeline.py` uses a fake ClickHouse client, so it checks the ingestion logic and not the real SQL. `test_integration.py` covers the real SQL in a separate `taxi_analytics_itest` database (it never touches the real tables). It is opt-in: `$env:RUN_CH_INTEGRATION="1"; python -m pytest test_integration.py -v`. It passed 5/5 on the author's machine (Windows 11, Docker Desktop, ClickHouse 24.8), including the negative control that proves the double-counting bug is real.
+* Parallel ingestion scales to only 1.50x on 4 workers (table above). The earlier "3.3x" figure compared different file sets and was withdrawn. Finding the shared bottleneck is open work.
