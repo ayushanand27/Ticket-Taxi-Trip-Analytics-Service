@@ -13,3 +13,8 @@ __pycache__/
 
 # Local environment overrides
 .env
+
+# Local notes, logs, assistant outputs (never commit)
+Claude outputs/
+CLAUDE.md
+*.log

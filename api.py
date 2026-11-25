@@ -220,3 +220,9 @@ def peak_hour_heatmap(response: Response) -> Dict[str, Any]:
             for r in rows
         ]
     }
+
+
+# Ticket 2: live stream endpoints
+from live_routes import router as live_router  # noqa: E402
+
+app.include_router(live_router)
